@@ -4,9 +4,10 @@ SRT Translator Service - Multi-AI translation engine with comprehensive error ha
 Supports: Gemini (Google), OpenAI (GPT), DeepL, Groq (LLaMA/Mixtral)
 
 Features:
+- Smart Auto Mode: auto-validate keys, load models, select best model
 - Multiple API key management with auto-rotation
 - Retry with exponential backoff
-- Fallback model support
+- Auto fallback: model A -> model B -> model C
 - Detailed error reporting (401, 403, 404, 429, network, timeout)
 - Batch processing with configurable size
 - Multi-threaded translation
@@ -724,7 +725,7 @@ class TranslationTask:
 
 
 class TranslateWorker(QThread):
-    """Worker thread for subtitle translation with full error handling."""
+    """Worker thread for subtitle translation with full error handling and smart fallback."""
 
     # Signals
     finished = Signal(list)
@@ -732,11 +733,12 @@ class TranslateWorker(QThread):
     progress = Signal(int, str)
     log_message = Signal(str)
     block_error = Signal(int, str, str)  # block_id, error_code, error_message
+    model_changed = Signal(str)  # emitted when auto-fallback changes model
 
     def __init__(self, entries: List[SubtitleEntry], engine: str,
                  model: str, source_lang: str, target_lang: str,
                  key_manager: APIKeyManager, batch_size: int = 10,
-                 num_threads: int = 1, parent=None):
+                 num_threads: int = 1, ai_manager=None, parent=None):
         super().__init__(parent)
         self.entries = entries
         self.engine = engine
@@ -744,6 +746,7 @@ class TranslateWorker(QThread):
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.key_manager = key_manager
+        self.ai_manager = ai_manager  # Optional AIManager for smart fallback
         self.batch_size = batch_size
         self.num_threads = max(1, min(num_threads, 20))
         self._stop_flag = False
@@ -811,7 +814,7 @@ class TranslateWorker(QThread):
             self.error.emit(str(e))
 
     def _translate_batch(self, task: TranslationTask):
-        """Translate a single batch with retry and key rotation."""
+        """Translate a single batch with smart retry, key rotation, and model fallback."""
         if self._stop_flag:
             return
 
@@ -899,61 +902,93 @@ class TranslateWorker(QThread):
                         )
 
                 ts = datetime.now().strftime("%H:%M:%S")
-                self._log(f"[{ts}] [{self.engine}] [{current_model}] Blocks {start_idx}-{end_idx} -> SUCCESS")
+                key_idx = self._get_key_index(current_key)
+                self._log(f"[{ts}] [{self.engine}] Key#{key_idx} [{current_model}] Blocks {start_idx}-{end_idx} -> SUCCESS")
                 self._update_progress()
                 return
 
             except Exception as e:
                 retry += 1
                 t_err = classify_error(e, self.engine, current_model, start_idx)
-                self._log(t_err.to_log_line())
+                key_idx = self._get_key_index(current_key)
+                self._log(f"[{t_err.timestamp}] [{self.engine}] Key#{key_idx} [{current_model}] Block {start_idx} -> ERROR {t_err.code.value} ({t_err.user_message})")
 
-                if t_err.code == TranslationErrorCode.AUTH_INVALID:
-                    # Rotate key
-                    new_key = self.key_manager.rotate_key(self.engine, current_key, t_err)
-                    if new_key and new_key != current_key:
-                        self._log(f"  -> Rotating API key...")
-                        current_key = new_key
-                    else:
-                        self._log(f"  -> Khong con API key kha dung")
+                # Use AIManager for smart fallback if available
+                if self.ai_manager:
+                    old_key, old_model = current_key, current_model
+                    fallback = self.ai_manager.handle_translation_error(
+                        self.engine, t_err.code, current_key, current_model
+                    )
+                    new_key = fallback.get("key")
+                    new_model = fallback.get("model")
+
+                    if new_key is None and new_model is None:
+                        self._log(f"  -> Khong con fallback kha dung")
                         self.block_error.emit(start_idx, str(t_err.code.value), t_err.user_message)
                         break
 
-                elif t_err.code == TranslationErrorCode.QUOTA_EXCEEDED:
-                    # Rotate key first
-                    new_key = self.key_manager.rotate_key(self.engine, current_key, t_err)
-                    if new_key and new_key != current_key:
-                        self._log(f"  -> Rotating API key...")
+                    if new_key and new_key != old_key:
                         current_key = new_key
-                    else:
-                        # Exponential backoff
+                        new_idx = self._get_key_index(new_key)
+                        self._log(f"  -> Auto switch -> Key#{new_idx}")
+
+                    if new_model and new_model != old_model:
+                        current_model = new_model
+                        self._log(f"  -> Auto fallback model: {old_model} -> {new_model}")
+                        self.model_changed.emit(new_model)
+
+                    # Backoff for rate-limit errors
+                    if t_err.code in (TranslationErrorCode.QUOTA_EXCEEDED,
+                                      TranslationErrorCode.NETWORK_ERROR,
+                                      TranslationErrorCode.TIMEOUT):
                         wait_time = min(2 ** retry, 60)
-                        self._log(f"  -> Rate limit, doi {wait_time}s (retry {retry}/{MAX_RETRY})")
+                        self._log(f"  -> Doi {wait_time}s (retry {retry}/{MAX_RETRY})")
+                        time.sleep(wait_time)
+                else:
+                    # Legacy fallback (no AIManager)
+                    if t_err.code == TranslationErrorCode.AUTH_INVALID:
+                        new_key = self.key_manager.rotate_key(self.engine, current_key, t_err)
+                        if new_key and new_key != current_key:
+                            self._log(f"  -> Rotating API key...")
+                            current_key = new_key
+                        else:
+                            self._log(f"  -> Khong con API key kha dung")
+                            self.block_error.emit(start_idx, str(t_err.code.value), t_err.user_message)
+                            break
+
+                    elif t_err.code == TranslationErrorCode.QUOTA_EXCEEDED:
+                        new_key = self.key_manager.rotate_key(self.engine, current_key, t_err)
+                        if new_key and new_key != current_key:
+                            self._log(f"  -> Rotating API key...")
+                            current_key = new_key
+                        else:
+                            wait_time = min(2 ** retry, 60)
+                            self._log(f"  -> Rate limit, doi {wait_time}s (retry {retry}/{MAX_RETRY})")
+                            time.sleep(wait_time)
+
+                    elif t_err.code == TranslationErrorCode.MODEL_NOT_FOUND:
+                        fallback_models = DEFAULT_MODELS.get(self.engine, [])
+                        fallback_found = False
+                        for fb_model in fallback_models:
+                            if fb_model != current_model:
+                                self._log(f"  -> Fallback sang model: {fb_model}")
+                                current_model = fb_model
+                                self.model_changed.emit(fb_model)
+                                fallback_found = True
+                                break
+                        if not fallback_found:
+                            self.block_error.emit(start_idx, str(t_err.code.value), t_err.user_message)
+                            break
+
+                    elif t_err.code in (TranslationErrorCode.NETWORK_ERROR, TranslationErrorCode.TIMEOUT):
+                        wait_time = min(2 ** retry, 30)
+                        self._log(f"  -> Retry sau {wait_time}s (retry {retry}/{MAX_RETRY})")
                         time.sleep(wait_time)
 
-                elif t_err.code == TranslationErrorCode.MODEL_NOT_FOUND:
-                    # Try fallback model
-                    fallback_models = DEFAULT_MODELS.get(self.engine, [])
-                    fallback_found = False
-                    for fb_model in fallback_models:
-                        if fb_model != current_model:
-                            self._log(f"  -> Fallback sang model: {fb_model}")
-                            current_model = fb_model
-                            fallback_found = True
-                            break
-                    if not fallback_found:
-                        self.block_error.emit(start_idx, str(t_err.code.value), t_err.user_message)
-                        break
-
-                elif t_err.code in (TranslationErrorCode.NETWORK_ERROR, TranslationErrorCode.TIMEOUT):
-                    wait_time = min(2 ** retry, 30)
-                    self._log(f"  -> Retry sau {wait_time}s (retry {retry}/{MAX_RETRY})")
-                    time.sleep(wait_time)
-
-                else:
-                    wait_time = min(2 ** retry, 30)
-                    self._log(f"  -> Retry sau {wait_time}s (retry {retry}/{MAX_RETRY})")
-                    time.sleep(wait_time)
+                    else:
+                        wait_time = min(2 ** retry, 30)
+                        self._log(f"  -> Retry sau {wait_time}s (retry {retry}/{MAX_RETRY})")
+                        time.sleep(wait_time)
 
         if retry >= MAX_RETRY:
             self._log(f"Blocks {start_idx}-{end_idx} -> SKIP (that bai sau {MAX_RETRY} lan thu)")
@@ -971,6 +1006,14 @@ class TranslateWorker(QThread):
             translated_count = len(self._translated)
 
         self.progress.emit(pct, f"Da dich {translated_count}/{len(self.entries)} blocks ({pct}%)")
+
+    def _get_key_index(self, key: str) -> int:
+        """Get the display index of an API key."""
+        keys = self.key_manager.get_keys(self.engine)
+        for i, entry in enumerate(keys, start=1):
+            if entry.key == key:
+                return i
+        return 0
 
     def _log(self, message: str):
         """Emit log message."""
@@ -1088,7 +1131,8 @@ class TranslatorService:
     def create_worker(cls, entries: List[SubtitleEntry], engine: str,
                       model: str, source_lang: str, target_lang: str,
                       batch_size: int = 10,
-                      num_threads: int = 1) -> TranslateWorker:
+                      num_threads: int = 1,
+                      ai_manager=None) -> TranslateWorker:
         return TranslateWorker(
             entries=entries,
             engine=engine,
@@ -1098,6 +1142,7 @@ class TranslatorService:
             key_manager=cls.get_key_manager(),
             batch_size=batch_size,
             num_threads=num_threads,
+            ai_manager=ai_manager,
         )
 
     @staticmethod
