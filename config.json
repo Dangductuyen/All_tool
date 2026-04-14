@@ -1,0 +1,54 @@
+{
+    "app": {
+        "name": "VideoEditor Pro",
+        "version": "1.0.0",
+        "language": "ENG",
+        "theme": "dark"
+    },
+    "paths": {
+        "projects_dir": "~/VideoEditorProjects",
+        "output_dir": "~/VideoEditorProjects/output",
+        "temp_dir": "~/VideoEditorProjects/temp"
+    },
+    "editor": {
+        "default_resolution": "1920x1080",
+        "default_fps": 30,
+        "auto_save": true,
+        "auto_save_interval": 300
+    },
+    "tts": {
+        "default_engine": "edge_tts",
+        "default_language": "vi-VN",
+        "default_speed": 1.0,
+        "output_format": "mp3"
+    },
+    "ocr": {
+        "engine": "paddleocr",
+        "use_gpu": false,
+        "luminance": 128
+    },
+    "audio": {
+        "whisper_model": "tiny",
+        "language": "auto",
+        "use_gpu": false,
+        "vad_enabled": false,
+        "split_vocal": false,
+        "quantize": false
+    },
+    "download": {
+        "default_platform": "tiktok",
+        "max_concurrent": 3,
+        "output_format": "mp4"
+    },
+    "translator": {
+        "default_engine": "openai",
+        "source_language": "auto",
+        "target_language": "vi"
+    },
+    "export": {
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "quality": "high",
+        "format": "mp4"
+    }
+}
