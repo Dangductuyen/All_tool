@@ -1,12 +1,14 @@
 """
-SRT Translator Pro Tab - Full-featured subtitle translator with multi-AI support.
+SRT Translator Pro Tab - Full-featured subtitle translator with Smart Auto Mode.
 
 Features:
+- Smart Auto Mode: auto-validate keys, load models via API, auto-select best model
 - Sidebar: AI selection, API key management, model selection, threads, batch size
 - Main area: SRT preview (original vs translated) with drag & drop
-- Log panel: Detailed debug logs with timestamps
+- Log panel: Detailed debug logs [Time] [AI] [Key Index] [Model] [Status]
+- Check API button: test all keys, show status per key
+- Auto fallback: model A -> model B -> model C
 - Format checking with strict mode
-- Buttons: Load model, Get API key, Check format, Translate, Stop, Export, Exit
 """
 import os
 import webbrowser
@@ -30,6 +32,9 @@ from services.translator_service import (
     TRANSLATOR_ENGINES, SUPPORTED_LANGUAGES, API_KEY_LINKS,
     DEFAULT_MODELS,
 )
+from services.ai_manager import AIManager, CheckAllKeysWorker
+from services.key_checker import KeyCheckResult, KeyCheckStatus
+from services.model_selector import MODEL_PRIORITY
 from utils.logger import log
 
 
@@ -62,7 +67,7 @@ class ModelLoadWorker(QThread):
 
 
 class SubtitleTranslatorTab(QWidget):
-    """Complete SRT Translator Pro tab with all features."""
+    """Complete SRT Translator Pro tab with Smart Auto Mode."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -72,10 +77,13 @@ class SubtitleTranslatorTab(QWidget):
         self._worker = None
         self._validate_worker = None
         self._model_worker = None
+        self._check_all_worker = None
         self._current_file = ""
         self._output_dir = ""
         self._strict_mode = False
+        self._smart_auto_mode = True  # Smart Auto Mode enabled by default
         self._key_manager = TranslatorService.get_key_manager()
+        self._ai_manager = AIManager(key_manager=self._key_manager)
         self._setup_ui()
         self._refresh_key_list()
 
@@ -213,6 +221,27 @@ class SubtitleTranslatorTab(QWidget):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
+        # ---- Smart Auto Mode Toggle ----
+        mode_group = QGroupBox("Smart Auto Mode")
+        mode_layout = QVBoxLayout(mode_group)
+
+        self.chk_smart_auto = QCheckBox("Smart Auto Mode")
+        self.chk_smart_auto.setChecked(True)
+        self.chk_smart_auto.setToolTip(
+            "Tu dong: validate key, load model, chon model toi uu, fallback khi loi.\n"
+            "User chi can nhap API key + chon AI -> Tool tu lam het."
+        )
+        self.chk_smart_auto.toggled.connect(self._on_smart_auto_toggled)
+        mode_layout.addWidget(self.chk_smart_auto)
+
+        self.lbl_smart_status = QLabel("ON - Tu dong chon model toi uu")
+        self.lbl_smart_status.setObjectName("subtitleLabel")
+        self.lbl_smart_status.setWordWrap(True)
+        self.lbl_smart_status.setStyleSheet("color: #4AD97A;")
+        mode_layout.addWidget(self.lbl_smart_status)
+
+        layout.addWidget(mode_group)
+
         # ---- AI Engine Selection ----
         engine_group = QGroupBox("AI Engine")
         engine_layout = QVBoxLayout(engine_group)
@@ -268,6 +297,15 @@ class SubtitleTranslatorTab(QWidget):
         self.btn_remove_key.clicked.connect(self._remove_selected_key)
         key_btn_row.addWidget(self.btn_remove_key)
         key_layout.addLayout(key_btn_row)
+
+        # Check API button (test ALL keys across ALL engines)
+        self.btn_check_api = AnimatedButton("Check API", color="#9B59B6")
+        self.btn_check_api.setFixedHeight(34)
+        self.btn_check_api.setToolTip(
+            "Test tat ca API key: validate, load models, auto chon model toi uu"
+        )
+        self.btn_check_api.clicked.connect(self._check_all_api_keys)
+        key_layout.addWidget(self.btn_check_api)
 
         layout.addWidget(key_group)
 
@@ -351,6 +389,10 @@ class SubtitleTranslatorTab(QWidget):
         layout.addStretch()
 
         sidebar_scroll.setWidget(sidebar_inner)
+
+        # Apply Smart Auto Mode UI state
+        self._update_smart_auto_ui()
+
         return sidebar_scroll
 
     def _create_file_bar(self) -> QHBoxLayout:
@@ -402,6 +444,166 @@ class SubtitleTranslatorTab(QWidget):
         bar.addWidget(self.btn_export)
 
         return bar
+
+    # ================================================================
+    # Smart Auto Mode
+    # ================================================================
+
+    def _on_smart_auto_toggled(self, checked: bool):
+        """Toggle Smart Auto Mode on/off."""
+        self._smart_auto_mode = checked
+        self._update_smart_auto_ui()
+
+        if checked:
+            self._add_log("Smart Auto Mode: ON - Tu dong chon model toi uu", level="success")
+            self.lbl_smart_status.setText("ON - Tu dong chon model toi uu")
+            self.lbl_smart_status.setStyleSheet("color: #4AD97A;")
+
+            # Auto-select model for current engine
+            engine = self._get_current_engine()
+            state = self._ai_manager.get_state(engine)
+            if state and state.active_model:
+                self._set_model_display(state.active_model, state.all_available_models)
+        else:
+            self._add_log("Smart Auto Mode: OFF - User chon model thu cong")
+            self.lbl_smart_status.setText("OFF - Chon model thu cong")
+            self.lbl_smart_status.setStyleSheet("color: #888888;")
+
+    def _update_smart_auto_ui(self):
+        """Update UI elements based on Smart Auto Mode state."""
+        is_smart = self._smart_auto_mode
+        # In Smart Auto Mode: model dropdown shows auto-selected model (still selectable as override)
+        # Load Models button hidden in smart mode (Check API does everything)
+        self.btn_load_model.setVisible(not is_smart)
+
+    def _set_model_display(self, selected_model: str, available_models: List[str] = None):
+        """Update model dropdown to show auto-selected model."""
+        self.cmb_model.clear()
+        if available_models:
+            for m in available_models:
+                self.cmb_model.addItem(m)
+            # Select the auto-selected model
+            idx = self.cmb_model.findText(selected_model)
+            if idx >= 0:
+                self.cmb_model.setCurrentIndex(idx)
+            self.lbl_model_status.setText(f"Auto-selected: {selected_model}")
+        elif selected_model:
+            self.cmb_model.addItem(selected_model)
+            self.lbl_model_status.setText(f"Auto-selected: {selected_model}")
+
+    # ================================================================
+    # Check All API Keys
+    # ================================================================
+
+    def _check_all_api_keys(self):
+        """Check ALL API keys - validates, loads models, auto-selects best."""
+        # Sync AI manager with current key manager state
+        self._ai_manager._sync_from_key_manager()
+
+        # Gather all keys
+        has_keys = False
+        for engine in TRANSLATOR_ENGINES:
+            keys = self._key_manager.get_keys(engine)
+            if keys:
+                has_keys = True
+                break
+
+        if not has_keys:
+            QMessageBox.warning(self, "Check API",
+                                "Chua co API key nao.\n"
+                                "Them API key truoc khi kiem tra.")
+            return
+
+        # Disable button during check
+        self.btn_check_api.setEnabled(False)
+        self.btn_check_api.setText("Dang kiem tra...")
+        self._add_log("=" * 50)
+        self._add_log("BAT DAU KIEM TRA API KEYS", level="info")
+
+        # Create background worker
+        worker = self._ai_manager.create_check_all_worker()
+        if not worker:
+            self.btn_check_api.setEnabled(True)
+            self.btn_check_api.setText("Check API")
+            return
+
+        self._check_all_worker = worker
+        self._check_all_worker.key_checked.connect(self._on_key_check_result)
+        self._check_all_worker.all_done.connect(self._on_all_keys_checked)
+        self._check_all_worker.log_message.connect(lambda msg: self._add_log(msg))
+        self._check_all_worker.start()
+
+    def _on_key_check_result(self, engine: str, key_index: int, result: KeyCheckResult):
+        """Handle individual key check result from Check API."""
+        # Apply result to AI manager
+        self._ai_manager.apply_check_result(result)
+
+        # Log with detailed format
+        if result.is_valid:
+            model_info = ""
+            if result.available_models:
+                from services.model_selector import select_best_model
+                selection = select_best_model(engine, result.available_models)
+                model_info = f" (model: {selection.selected_model})"
+            self._add_log(
+                f"[{engine.upper()}] Key {key_index} -> OK{model_info}",
+                level="success"
+            )
+        else:
+            status_msg = result.message
+            self._add_log(
+                f"[{engine.upper()}] Key {key_index} -> FAIL ({status_msg})",
+                level="error"
+            )
+
+        # Refresh key list if this is the current engine
+        if engine == self._get_current_engine():
+            self._refresh_key_list()
+
+    def _on_all_keys_checked(self, results: list):
+        """Handle completion of all key checks."""
+        self.btn_check_api.setEnabled(True)
+        self.btn_check_api.setText("Check API")
+
+        # Finalize for all engines
+        engines_checked = set()
+        for result in results:
+            engines_checked.add(result.engine)
+
+        for engine in engines_checked:
+            self._ai_manager.finalize_check(engine)
+
+        # Update UI for current engine
+        engine = self._get_current_engine()
+        state = self._ai_manager.get_state(engine)
+
+        if state:
+            # Update model dropdown with auto-selected model
+            if self._smart_auto_mode and state.active_model:
+                self._set_model_display(state.active_model, state.all_available_models)
+
+            # Show summary
+            summary = state.get_status_summary()
+            self.lbl_model_status.setText(summary)
+
+        # Log summary
+        self._add_log("=" * 50)
+        self._add_log("KET QUA KIEM TRA API:")
+        valid_count = sum(1 for r in results if r.is_valid)
+        total_count = len(results)
+        self._add_log(f"  Tong: {valid_count}/{total_count} key hop le")
+
+        for engine in engines_checked:
+            engine_results = [r for r in results if r.engine == engine]
+            engine_valid = sum(1 for r in engine_results if r.is_valid)
+            engine_state = self._ai_manager.get_state(engine)
+            model_info = f" | Model: {engine_state.active_model}" if engine_state and engine_state.active_model else ""
+            self._add_log(f"  [{engine.upper()}] {engine_valid}/{len(engine_results)} key OK{model_info}")
+
+        self._add_log("=" * 50)
+        self.lbl_status.setText(f"Check API xong: {valid_count}/{total_count} key hop le")
+
+        self._refresh_key_list()
 
     # ================================================================
     # Drag & Drop
@@ -477,8 +679,19 @@ class SubtitleTranslatorTab(QWidget):
     # ================================================================
 
     def _on_engine_changed(self, index: int):
-        """Handle engine change."""
-        self._load_default_models()
+        """Handle engine change - update models and key list."""
+        engine = self._get_current_engine()
+
+        if self._smart_auto_mode:
+            # In Smart Auto Mode, show auto-selected model for this engine
+            state = self._ai_manager.get_state(engine)
+            if state and state.is_checked and state.active_model:
+                self._set_model_display(state.active_model, state.all_available_models)
+            else:
+                self._load_default_models()
+        else:
+            self._load_default_models()
+
         self._refresh_key_list()
 
     def _get_current_engine(self) -> str:
@@ -493,6 +706,7 @@ class SubtitleTranslatorTab(QWidget):
 
         engine = self._get_current_engine()
         if self._key_manager.add_key(engine, key):
+            self._ai_manager.add_key(engine, key)
             self.txt_api_key.clear()
             self._refresh_key_list()
             self._add_log(f"Da them API key cho {engine}")
@@ -510,6 +724,7 @@ class SubtitleTranslatorTab(QWidget):
 
         engine = self._get_current_engine()
         if self._key_manager.remove_key(engine, key):
+            self._ai_manager.remove_key(engine, key)
             self._refresh_key_list()
             self._add_log(f"Da xoa API key khoi {engine}")
 
@@ -550,12 +765,19 @@ class SubtitleTranslatorTab(QWidget):
         self._refresh_key_list()
 
     def _refresh_key_list(self):
-        """Refresh the API key list display."""
+        """Refresh the API key list display with status from AIManager."""
         self.list_keys.clear()
         engine = self._get_current_engine()
         keys = self._key_manager.get_keys(engine)
 
-        for entry in keys:
+        # Get AI manager state for richer info
+        ai_state = self._ai_manager.get_state(engine)
+        ai_key_map = {}
+        if ai_state:
+            for ks in ai_state.keys:
+                ai_key_map[ks.key] = ks
+
+        for i, entry in enumerate(keys, start=1):
             # Show masked key with status icon
             masked = entry.key[:8] + "..." + entry.key[-4:] if len(entry.key) > 12 else entry.key
             status_icons = {
@@ -565,7 +787,14 @@ class SubtitleTranslatorTab(QWidget):
                 KeyStatus.UNCHECKED: "[?]",
             }
             icon = status_icons.get(entry.status, "[?]")
-            display = f"{icon} {masked}"
+
+            # Add model info from AI manager if available
+            model_info = ""
+            ai_ks = ai_key_map.get(entry.key)
+            if ai_ks and ai_ks.selected_model:
+                model_info = f" [{ai_ks.selected_model}]"
+
+            display = f"K{i} {icon} {masked}{model_info}"
 
             item = QListWidgetItem(display)
             item.setData(Qt.ItemDataRole.UserRole, entry.key)
@@ -580,8 +809,15 @@ class SubtitleTranslatorTab(QWidget):
             else:
                 item.setForeground(QColor("#888888"))
 
+            tooltip_parts = []
             if entry.last_error:
-                item.setToolTip(entry.last_error)
+                tooltip_parts.append(f"Error: {entry.last_error}")
+            if ai_ks and ai_ks.usage_info:
+                tooltip_parts.append(f"Usage: {ai_ks.usage_info}")
+            if ai_ks and ai_ks.available_models:
+                tooltip_parts.append(f"Models: {len(ai_ks.available_models)} kha dung")
+            if tooltip_parts:
+                item.setToolTip("\n".join(tooltip_parts))
 
             self.list_keys.addItem(item)
 
@@ -607,7 +843,7 @@ class SubtitleTranslatorTab(QWidget):
         self.lbl_model_status.setText(f"Default models ({len(models)})")
 
     def _load_models_from_api(self):
-        """Load models from API."""
+        """Load models from API (manual mode only)."""
         engine = self._get_current_engine()
         api_key = self._key_manager.get_best_key(engine)
         if not api_key:
@@ -642,23 +878,54 @@ class SubtitleTranslatorTab(QWidget):
     # ================================================================
 
     def _start_translate(self):
-        """Start translation process."""
+        """Start translation process with Smart Auto Mode support."""
         if not self._entries:
             QMessageBox.information(self, "Dich", "Vui long load file SRT truoc")
             return
 
         engine = self._get_current_engine()
-        api_key = self._key_manager.get_best_key(engine)
-        if not api_key:
-            QMessageBox.warning(self, "Dich",
-                                f"Can API key cho {engine}.\n"
-                                f"Them key trong phan 'API Keys' ben trai.")
-            return
 
-        model = self.cmb_model.currentText()
-        if not model:
-            QMessageBox.warning(self, "Dich", "Vui long chon model")
-            return
+        # In Smart Auto Mode, use AI Manager for key/model selection
+        if self._smart_auto_mode:
+            state = self._ai_manager.get_state(engine)
+            api_key = None
+            model = None
+
+            if state and state.has_valid_key:
+                api_key = state.active_key
+                model = state.active_model
+
+            # Fallback to key_manager if AI manager hasn't been checked
+            if not api_key:
+                api_key = self._key_manager.get_best_key(engine)
+            if not model:
+                model = self.cmb_model.currentText()
+
+            if not api_key:
+                QMessageBox.warning(self, "Dich",
+                                    f"Can API key cho {engine}.\n"
+                                    f"Them key va bam 'Check API' truoc khi dich.")
+                return
+
+            if not model:
+                # Auto-select from priority
+                priority = MODEL_PRIORITY.get(engine, [])
+                model = priority[0] if priority else ""
+                if not model:
+                    QMessageBox.warning(self, "Dich", "Khong tim thay model phu hop")
+                    return
+        else:
+            api_key = self._key_manager.get_best_key(engine)
+            if not api_key:
+                QMessageBox.warning(self, "Dich",
+                                    f"Can API key cho {engine}.\n"
+                                    f"Them key trong phan 'API Keys' ben trai.")
+                return
+
+            model = self.cmb_model.currentText()
+            if not model:
+                QMessageBox.warning(self, "Dich", "Vui long chon model")
+                return
 
         source = self.cmb_source.currentData()
         target = self.cmb_target.currentData()
@@ -678,10 +945,12 @@ class SubtitleTranslatorTab(QWidget):
         batch_size = self.spin_batch.value()
         num_threads = self.spin_threads.value()
 
-        self._add_log(f"Bat dau dich: {engine}/{model}, batch={batch_size}, threads={num_threads}")
+        mode_label = "Smart Auto" if self._smart_auto_mode else "Manual"
+        self._add_log(f"Bat dau dich [{mode_label}]: {engine}/{model}, batch={batch_size}, threads={num_threads}")
         self._add_log(f"Ngon ngu: {source} -> {target}, {len(self._entries)} blocks")
 
-        # Create and start worker
+        # Create and start worker (with AIManager if in smart mode)
+        ai_mgr = self._ai_manager if self._smart_auto_mode else None
         self._worker = TranslatorService.create_worker(
             entries=self._entries,
             engine=engine,
@@ -690,12 +959,14 @@ class SubtitleTranslatorTab(QWidget):
             target_lang=target,
             batch_size=batch_size,
             num_threads=num_threads,
+            ai_manager=ai_mgr,
         )
         self._worker.finished.connect(self._on_translated)
         self._worker.error.connect(self._on_error)
         self._worker.progress.connect(self._on_progress)
         self._worker.log_message.connect(lambda msg: self._add_log(msg))
         self._worker.block_error.connect(self._on_block_error)
+        self._worker.model_changed.connect(self._on_model_auto_changed)
         self._worker.start()
 
     def _stop_translate(self):
@@ -709,6 +980,17 @@ class SubtitleTranslatorTab(QWidget):
         """Handle progress update."""
         self.progress.setValue(value)
         self.lbl_status.setText(status)
+
+    def _on_model_auto_changed(self, new_model: str):
+        """Handle auto model change from fallback."""
+        # Update model dropdown to reflect the auto-changed model
+        idx = self.cmb_model.findText(new_model)
+        if idx >= 0:
+            self.cmb_model.setCurrentIndex(idx)
+        else:
+            self.cmb_model.addItem(new_model)
+            self.cmb_model.setCurrentIndex(self.cmb_model.count() - 1)
+        self.lbl_model_status.setText(f"Auto fallback -> {new_model}")
 
     def _on_translated(self, entries: list):
         """Handle translation completion."""
