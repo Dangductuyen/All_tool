@@ -41,9 +41,12 @@
         "output_format": "mp4"
     },
     "translator": {
-        "default_engine": "openai",
+        "default_engine": "gemini",
         "source_language": "auto",
-        "target_language": "vi"
+        "target_language": "vi",
+        "batch_size": 10,
+        "num_threads": 1,
+        "strict_mode": false
     },
     "export": {
         "video_codec": "h264",
