@@ -276,7 +276,6 @@ class SubtitleTranslatorTab(QWidget):
         model_layout = QVBoxLayout(model_group)
 
         self.cmb_model = QComboBox()
-        self._load_default_models()
         model_layout.addWidget(self.cmb_model)
 
         self.btn_load_model = AnimatedButton("Load Models from API", color="#4A90D9")
@@ -288,6 +287,9 @@ class SubtitleTranslatorTab(QWidget):
         self.lbl_model_status.setObjectName("subtitleLabel")
         self.lbl_model_status.setWordWrap(True)
         model_layout.addWidget(self.lbl_model_status)
+
+        # Load default models after lbl_model_status is created
+        self._load_default_models()
 
         layout.addWidget(model_group)
 
